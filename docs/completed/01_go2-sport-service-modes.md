@@ -2,7 +2,13 @@
 
 Implementation completed: 2026-10-19
 Status: Implemented and verified
-Implementation commits: **Uncommitted**. No implementation commit or push was requested in this phase.
+## Implementation Commits
+
+| SHA | Subject |
+| --- | --- |
+| `94ac0c6` | feat: support Go2 sport service deployments |
+
+The documentation-only commit recording this table is excluded.
 
 ## 1. Requirements and Outcome
 
@@ -187,7 +193,7 @@ Build directories and logs are ignored generated artifacts; rerun the commands t
 4. Invalidated commands on a feedback receive gap even if reconnection occurs before the control loop observes a stale tick. A failing regression preceded the fix.
 5. Added sensor-data validation before bridge construction after a failing twelve-actuator/sensorless XML regression. Wrong actuator count alone was insufficient to prevent invalid sensor indexing.
 6. Fixed existing BMS/WirelessController publication paths to acquire trylock before unlockAndPublish. HG execution exercised the BMS path. Physical joystick input was not exercised.
-7. Preserved the user's existing simulator CMake edits and `_test/`. SDK headers, binaries and reconstructed sources were unchanged. No worktree, agent delegation, implementation commit or push was created in this phase.
+7. Preserved the user's existing simulator CMake edits and `_test/`. SDK headers, binaries and reconstructed sources were unchanged. No worktree or agent delegation was used. Implementation was committed after verification at the user's request; no push was performed.
 
 Stopping adapter publication does not remove a command already latched by the low-level simulator. Multiple server/writer arbitration, hardware use and additional Sport motions remain outside this feature's scope. Timing is best effort, and external trajectories use wall time while internal trajectories use simulation time.
 
