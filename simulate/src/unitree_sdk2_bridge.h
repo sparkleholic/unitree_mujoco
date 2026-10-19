@@ -12,6 +12,8 @@
 #include <iostream>
 
 #include "param.h"
+#include "go2_control_session.h"
+#include "go2_sport_server.h"
 #include "physics_joystick.h"
 
 #define MOTOR_SENSOR_NUM 3
@@ -39,7 +41,9 @@ public:
 
     }
 
+    virtual ~UnitreeSDK2BridgeBase() = default;
     virtual void start() {}
+    virtual void run() = 0;
 
     void printSceneInformation()
     {
@@ -157,7 +161,7 @@ using WirelessController_t = unitree::robot::go2::publisher::WirelessController;
 public:
     RobotBridge(mjModel *model, mjData *data) : UnitreeSDK2BridgeBase(model, data)
     {
-        lowcmd = std::make_shared<LowCmd_t>("rt/lowcmd");
+        if (param::config.control == "lowcmd") lowcmd = std::make_shared<LowCmd_t>("rt/lowcmd");
         lowstate = std::make_unique<LowState_t>();
         lowstate->joystick = joystick;
         highstate = std::make_unique<HighState_t>();
@@ -167,16 +171,31 @@ public:
 
     void start()
     {
-        thread_ = std::make_shared<unitree::common::RecurrentThread>(
-            "unitree_bridge", UT_CPU_ID_NONE, 1000, [this]() { this->run(); });
+        if (param::config.control == "sport") {
+            sport_server_ = std::make_unique<go2_sim::Go2SportServer>([this](go2_sim::StandPose pose) {
+                return session_.Request(pose, go2_sim::SteadySeconds());
+            });
+            sport_server_->Init();
+            sport_server_->Start();
+        }
     }
 
     virtual void run()
     {
         if(!mj_data_) return;
         if(lowstate->joystick) { lowstate->joystick->update(); }
-        // lowcmd
-        {
+        // Called by the physics owner under the simulation mutex, never an RPC callback.
+        if (param::config.control == "sport") {
+            go2_sim::Posture measured{};
+            for (size_t i = 0; i < measured.size(); ++i) measured[i] = mj_data_->sensordata[i];
+            const double now = go2_sim::SteadySeconds();
+            session_.Feedback(measured, now);
+            const auto target = session_.Tick(mj_data_->time, now);
+            for (int i = 0; i < num_motor_; ++i) {
+                mj_data_->ctrl[i] = target ? 50.0 * ((*target)[i] - measured[i])
+                    - 3.5 * mj_data_->sensordata[i + num_motor_] : 0.0;
+            }
+        } else {
             std::lock_guard<std::mutex> lock(lowcmd->mutex_);
             for(int i(0); i<num_motor_; i++) {
                 auto & m = lowcmd->msg_.motor_cmd()[i];
@@ -240,7 +259,7 @@ public:
             highstate->unlockAndPublish();
         }
         // wireless_controller
-        if(wireless_controller->joystick) {
+        if(wireless_controller->joystick && wireless_controller->trylock()) {
             wireless_controller->unlockAndPublish();
         }
     }
@@ -251,7 +270,9 @@ public:
     std::unique_ptr<LowState_t> lowstate;
     
 private:
-    unitree::common::RecurrentThreadPtr thread_;
+    go2_sim::Go2ControlSession session_;
+    // Destroy the server first, while its callback state is still alive.
+    std::unique_ptr<go2_sim::Go2SportServer> sport_server_;
 };
 
 using Go2Bridge = RobotBridge<unitree::robot::go2::subscription::LowCmd, unitree::robot::go2::publisher::LowState>;
@@ -313,7 +334,7 @@ public:
         }
 
         // In practice, bmsstate is sent at a low frequency; here it is sent with the main loop
-        bmsstate->unlockAndPublish();
+        if (bmsstate->trylock()) bmsstate->unlockAndPublish();
     }
 
     using BmsState_t = unitree::robot::RealTimePublisher<unitree_hg::msg::dds_::BmsState_>;
@@ -321,3 +342,16 @@ public:
     std::unique_ptr<BmsState_t> bmsstate;
     std::unique_ptr<IMUState_t> secondary_imustate;
 };
+
+inline std::unique_ptr<UnitreeSDK2BridgeBase> CreateUnitreeBridge(mjModel* model, mjData* data)
+{
+    const int idl = param::ResolveIdlType(param::config.robot, model->nu, param::config.idl_type);
+    param::ValidateControl(param::config.control, param::config.robot, idl, model->nu);
+    if (model->nsensordata < MOTOR_SENSOR_NUM * model->nu)
+        throw std::invalid_argument("model must provide position, velocity and torque motor sensors");
+    std::unique_ptr<UnitreeSDK2BridgeBase> bridge;
+    if (idl == param::IDL_HG) bridge = std::make_unique<G1Bridge>(model, data);
+    else bridge = std::make_unique<Go2Bridge>(model, data);
+    bridge->start();
+    return bridge;
+}

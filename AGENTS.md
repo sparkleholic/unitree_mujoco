@@ -11,6 +11,11 @@ This project connects MuJoCo simulation with the Unitree SDK. Do not hard-code a
 - Instructions from other projects are references. Rules adopted for this project must be stated here.
 - Commit, push, merge, or clean up existing user changes only when the user requests it.
 - Always write commit messages in English, including the subject and body.
+- Limit every commit message line to 78 characters, including the subject,
+  body, and footers. Wrap prose at word boundaries.
+- Avoid unnecessary whitespace in commit messages: no trailing spaces,
+  alignment padding, or repeated spaces. Use blank lines only to separate
+  the subject, body paragraphs, and footers.
 
 ## 2. Documentation Model
 

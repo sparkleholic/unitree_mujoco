@@ -1,4 +1,9 @@
 #include <iostream>
+#include <atomic>
+#include "go2_options.h"
+#include <unitree/robot/go2/sport/sport_client.hpp>
+#include <chrono>
+#include <thread>
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
@@ -22,8 +27,14 @@ class Custom
 {
 public:
     Custom(){};
-    ~Custom(){};
     void Init();
+    ~Custom() { Stop(); }
+    void Stop() {
+        stop_ = true;
+        if (lowCmdWriteThread.joinable()) lowCmdWriteThread.join();
+        if (lowstate_subscriber) lowstate_subscriber->CloseChannel();
+    }
+    std::string action = "sequence";
 
 private:
     void InitLowCmd();
@@ -48,7 +59,8 @@ private:
     ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_> lowstate_subscriber;
 
     /*LowCmd write thread*/
-    ThreadPtr lowCmdWriteThreadPtr;
+    std::thread lowCmdWriteThread;
+    std::atomic<bool> stop_{false};
 };
 
 uint32_t crc32_core(uint32_t *ptr, uint32_t len)
@@ -95,7 +107,14 @@ void Custom::Init()
     lowstate_subscriber->InitChannel(std::bind(&Custom::LowStateMessageHandler, this, std::placeholders::_1), 1);
 
     /*loop publishing thread*/
-    lowCmdWriteThreadPtr = CreateRecurrentThreadEx("writebasiccmd", UT_CPU_ID_NONE, int(dt * 1000000), &Custom::LowCmdWrite, this);
+    lowCmdWriteThread = std::thread([this] {
+        auto deadline = std::chrono::steady_clock::now();
+        while (!stop_) {
+            LowCmdWrite();
+            deadline += std::chrono::milliseconds(2);
+            std::this_thread::sleep_until(deadline);
+        }
+    });
 }
 
 void Custom::InitLowCmd()
@@ -118,14 +137,14 @@ void Custom::InitLowCmd()
 
 void Custom::LowStateMessageHandler(const void *message)
 {
-    low_state = *(unitree_go::msg::dds_::LowState_ *)message;
+    (void)message;
 }
 
 void Custom::LowCmdWrite()
 {
 
     runing_time += dt;
-    if (runing_time < 3.0)
+    if (action == "standup" || (action == "sequence" && runing_time < 3.0))
     {
         // Stand up in first 3 second
 
@@ -143,7 +162,7 @@ void Custom::LowCmdWrite()
     else
     {
         // Then stand down
-        phase = tanh((runing_time - 3.0) / 1.2);
+        phase = tanh((runing_time - (action == "sequence" ? 3.0 : 0.0)) / 1.2);
         for (int i = 0; i < 12; i++)
         {
             low_cmd.motor_cmd()[i].q() = phase * stand_down_joint_pos[i] + (1 - phase) * stand_up_joint_pos[i];
@@ -158,25 +177,47 @@ void Custom::LowCmdWrite()
     lowcmd_publisher->Write(low_cmd);
 }
 
-int main(int argc, const char **argv)
+int main(int argc, char** argv)
 {
-    if (argc < 2)
-    {
-        ChannelFactory::Instance()->Init(1, "lo");
-    }
-    else
-    {
-        ChannelFactory::Instance()->Init(0, argv[1]);
-    }
-    std::cout << "Press enter to start";
-    std::cin.get();
-    Custom custom;
-    custom.Init();
-
-    while (1)
-    {
-        sleep(10);
-    }
-
-    return 0;
+    using namespace go2_sim;
+    try {
+        const auto options = ParseOptions(argc, argv);
+        if (options.help) { PrintOptions(); return 0; }
+        InstallSignals();
+        ChannelFactory::Instance()->Init(options.domain, options.network);
+        if (!options.automatic) { std::cout << "Press enter to start" << std::endl; std::cin.get(); }
+        if (options.api == "sport") {
+            unitree::robot::go2::SportClient client;
+            client.SetTimeout(1.0f);
+            client.Init();
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            auto issue = [&](bool up) {
+                const int code = up ? client.StandUp() : client.StandDown();
+                std::cout << (up ? "StandUp" : "StandDown") << " result=" << code << std::endl;
+                return code == 0;
+            };
+            if (!issue(options.action != "standdown")) return 1;
+            const auto start = std::chrono::steady_clock::now();
+            bool down = false;
+            while (!stop_requested) {
+                const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (options.action == "sequence" && !down && elapsed >= 6) {
+                    if (!issue(false)) return 1;
+                    down = true;
+                }
+                if (options.duration && elapsed >= options.duration) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        } else {
+            Custom custom;
+            custom.action = options.action;
+            custom.Init();
+            const auto start = std::chrono::steady_clock::now();
+            while (!stop_requested && (!options.duration ||
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < options.duration))
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            custom.Stop();
+        }
+        return 0;
+    } catch (const std::exception& e) { std::cerr << e.what() << std::endl; return 2; }
 }

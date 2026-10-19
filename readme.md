@@ -11,7 +11,7 @@
 - `example`: Example programs
 
 ## Supported Unitree sdk2 Messages:
-**Current version only supports low-level development, mainly used for sim to real verification of controller**
+**Low-level control remains the default. The C++ simulator also supports Go2 StandUp/StandDown through a simulation sport service, either in-process or through an external adapter; see [Go2 Sport service](#go2-sport-service-c-only).**
 - `LowCmd`: Motor control commands
 - `LowState`: Motor state information
 - `SportModeState`: Robot position and velocity data
@@ -324,3 +324,103 @@ source ~/unitree_ros2/setup.sh # Use the network card connected to the robot
 export ROS_DOMAIN_ID=0 # Use the default domain id
 ./install/stand_go2/bin/stand_go2 # Run
 ```
+
+
+## Go2 Sport service (C++ only)
+
+The C++ example supports both direct LowCmd control and the actual SDK
+`SportClient::StandUp()` / `StandDown()` methods. Service mode provides a
+simulation posture controller using the example's joint targets. It does not
+implement the physical robot's proprietary locomotion/balance controller or
+other Sport actions. The Python simulator is unchanged.
+
+Build from the repository root after installing the existing simulator dependencies:
+
+```sh
+cmake -S simulate -B simulate/build
+cmake --build simulate/build -j2
+cmake -S example/cpp -B example/cpp/build
+cmake --build example/cpp/build -j2
+```
+
+Choose **one** of the following configurations. Run each command in a separate
+terminal, using the same domain and interface. Stop a configuration before
+starting another. Use one sport server and one LowCmd writer per domain;
+internal-server and external-adapter deployments must not run together.
+
+### Direct LowCmd: two processes
+
+```sh
+simulate/build/unitree_mujoco --control lowcmd -r go2 -i 1 -n lo
+example/cpp/build/stand_go2 --api lowcmd --auto --duration 12
+```
+
+The original interactive `stand_go2` invocation and positional network argument
+remain available. The default LowCmd sequence retains its original tanh
+trajectory and starts StandDown after 3 seconds.
+
+### External adapter: three processes
+
+```sh
+simulate/build/unitree_mujoco --control lowcmd -r go2 -i 1 -n lo
+example/cpp/build/go2_sport_adapter --domain 1 --network lo
+example/cpp/build/stand_go2 --api sport --auto --duration 12
+```
+
+The adapter receives sport RPCs and publishes LowCmd to an ordinary low-level
+simulator. The simulator does not need to implement a service for this deployment.
+The adapter waits for fresh LowState and a command before publishing. At 500ms
+without feedback it stops publishing, rejects requests, and requires a new command
+after reconnection. Stopping publication does not clear a LowCmd already latched
+by the low-level simulator.
+
+### Internal server: two processes
+
+```sh
+simulate/build/unitree_mujoco --control sport -r go2 -i 1 -n lo
+example/cpp/build/stand_go2 --api sport --auto --duration 12
+```
+
+The simulator owns both the service and posture controller. External LowCmd is
+not subscribed to in this mode. Only Go2 GO-IDL 12-joint configurations are
+accepted. The optional YAML `control` key defaults to `lowcmd` when absent;
+`--control` overrides it.
+
+Service trajectories start at the measured joint posture and use a 2-second
+smoothstep with kp=50 and kd=3.5, holding the target afterward. A new request
+restarts from current feedback. Both service deployments use the same controller.
+Internal trajectory time follows simulation time, including pause; external
+adapter time follows a monotonic wall clock. The sport sequence starts StandDown
+after 6 seconds. Use `--action standup` or `--action standdown` for a single action.
+
+An RPC return value of zero means **accepted**, not motion completed. Unsupported
+request/response actions such as Sit return `3203`; missing/stale feedback returns
+`3202`; an absent server produces a client error such as timeout `3104`. SDK Move
+uses a no-reply transport, so its return value cannot report a server rejection.
+
+For display-free testing, add `--headless` to the simulator command. This runs
+the same MuJoCo model and SDK bridge without the GUI. `--duration SECONDS` limits
+headless simulator wall-clock runtime. The headless path loads XML scenes and
+does not apply the optional GUI elastic band. Use Ctrl+C to stop the headless
+simulator and adapter cleanly.
+
+### Verification
+
+```sh
+ctest --test-dir example/cpp/build --output-on-failure
+python3 tests/run_go2_sport_modes.py \
+  --simulator simulate/build/unitree_mujoco \
+  --bin-dir example/cpp/build --network lo --domain 71 \
+  --output tests/build/go2-sport-results
+```
+
+The runner checks direct control, both service deployments, conflicting LowCmd
+exclusion, feedback timeout/reconnection, unsupported APIs, invalid configurations,
+and GO/HG low-level initialization. It collects actual LowState and SportModeState
+feedback and requires joint RMSE at most 0.15rad and a standing-height increase of
+at least 0.08m. JSON results, sensor CSVs, and process logs are written to the output
+directory. CTest additionally checks the real bridge's pause, reset, reload, and
+shutdown behavior. Integration tests require the repository's MuJoCo dependency;
+configure the example with `-DBUILD_TESTING=OFF` to build only the two applications.
+
+See the [completed implementation record](docs/completed/01_go2-sport-service-modes.md) for design decisions, measured verification results, and extension points.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <cmath>
 #include <boost/program_options.hpp>
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
@@ -42,6 +43,15 @@ inline int ResolveIdlType(const std::string &robot, int actuator_count, int conf
     return idl_type;
 }
 
+inline void ValidateControl(const std::string& control, const std::string& robot,
+                            int idl, int actuator_count)
+{
+    if (control != "lowcmd" && control != "sport")
+        throw std::invalid_argument("control must be lowcmd or sport");
+    if (control == "sport" && (robot != "go2" || idl != IDL_GO || actuator_count != 12))
+        throw std::invalid_argument("sport control requires a Go2 GO-IDL 12-joint model");
+}
+
 inline struct SimulationConfig
 {
     std::string robot;
@@ -50,6 +60,9 @@ inline struct SimulationConfig
     int domain_id;
     std::string interface;
     int idl_type = IDL_AUTO;
+    std::string control = "lowcmd";
+    bool headless = false;
+    double duration = 0;
 
     int use_joystick;
     std::string joystick_type;
@@ -74,6 +87,7 @@ inline struct SimulationConfig
             {
                 idl_type = cfg["idl_type"].as<int>();
             }
+            if (cfg["control"]) control = cfg["control"].as<std::string>();
             use_joystick = cfg["use_joystick"].as<int>();
             joystick_type = cfg["joystick_type"].as<std::string>();
             joystick_device = cfg["joystick_device"].as<std::string>();
@@ -98,6 +112,9 @@ inline po::variables_map helper(int argc, char** argv)
     po::options_description desc("Unitree Mujoco");
     desc.add_options()
         ("help,h", "Show help message")
+        ("control", po::value<std::string>(&config.control), "Control source: lowcmd (default) or sport (Go2)")
+        ("headless", po::bool_switch(&config.headless), "Run the same MuJoCo model and bridge without a GUI")
+        ("duration", po::value<double>(&config.duration), "Exit after this many wall-clock seconds (headless only)")
         ("domain_id,i", po::value<int>(&config.domain_id), "DDS domain ID; -i 0")
         ("network,n", po::value<std::string>(&config.interface), "DDS network interface; -n eth0")
         ("robot,r", po::value<std::string>(&config.robot), "Robot type; -r go2")
@@ -115,6 +132,12 @@ inline po::variables_map helper(int argc, char** argv)
         exit(0);
     }
 
+    if (config.control != "lowcmd" && config.control != "sport")
+        throw std::invalid_argument("control must be lowcmd or sport");
+    if (!std::isfinite(config.duration) || config.duration < 0)
+        throw std::invalid_argument("duration must be finite and nonnegative");
+    if (config.duration && !config.headless)
+        throw std::invalid_argument("duration requires headless mode");
     return vm;
 }
 

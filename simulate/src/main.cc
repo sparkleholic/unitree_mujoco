@@ -34,6 +34,7 @@
 #include "array_safety.h"
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
+#include "go2_options.h"
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 
@@ -98,6 +99,17 @@ namespace
   // model and data
   mjModel *m = nullptr;
   mjData *d = nullptr;
+  std::unique_ptr<UnitreeSDK2BridgeBase> sdk_bridge;
+  std::atomic<int> physics_result{0};
+
+  void PrepareBridge() {
+    int body_id = mj_name2id(m, mjOBJ_BODY, "torso_link");
+    if (body_id < 0) body_id = mj_name2id(m, mjOBJ_BODY, "base_link");
+    param::config.band_attached_link = body_id >= 0 ? 6 * body_id : 0;
+    sdk_bridge = CreateUnitreeBridge(m, d);
+    std::cout << "Bridge ready: robot=" << param::config.robot
+              << " control=" << param::config.control << std::endl;
+  }
 
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
@@ -347,7 +359,9 @@ namespace
           dnew = mj_makeData(mnew);
         if (dnew)
         {
+          sdk_bridge.reset();
           sim.Load(mnew, dnew, sim.dropfilename);
+          const std::unique_lock<std::recursive_mutex> model_lock(sim.mtx);
 
           mj_deleteData(d);
           mj_deleteModel(m);
@@ -355,6 +369,7 @@ namespace
           m = mnew;
           d = dnew;
           mj_forward(m, d);
+          PrepareBridge();
 
           // allocate ctrlnoise
           free(ctrlnoise);
@@ -377,7 +392,9 @@ namespace
           dnew = mj_makeData(mnew);
         if (dnew)
         {
+          sdk_bridge.reset();
           sim.Load(mnew, dnew, sim.filename);
+          const std::unique_lock<std::recursive_mutex> model_lock(sim.mtx);
 
           mj_deleteData(d);
           mj_deleteModel(m);
@@ -385,6 +402,7 @@ namespace
           m = mnew;
           d = dnew;
           mj_forward(m, d);
+          PrepareBridge();
 
           // allocate ctrlnoise
           free(ctrlnoise);
@@ -461,6 +479,7 @@ namespace
               sim.speed_changed = false;
 
               // run single step, let next iteration deal with timing
+              if (sdk_bridge) sdk_bridge->run();
               mj_step(m, d);
               stepped = true;
             }
@@ -502,6 +521,7 @@ namespace
                 }
 
                 // call mj_step
+                if (sdk_bridge) sdk_bridge->run();
                 mj_step(m, d);
                 stepped = true;
 
@@ -525,6 +545,7 @@ namespace
           {
             // run mj_forward, to update rendering and joint sliders
             mj_forward(m, d);
+            if (sdk_bridge) sdk_bridge->run();
             sim.speed_changed = true;
           }
         }
@@ -537,83 +558,72 @@ namespace
 
 void PhysicsThread(mj::Simulate *sim, const char *filename)
 {
-  // request loadmodel if file given (otherwise drag-and-drop)
-  if (filename != nullptr)
-  {
-    sim->LoadMessage(filename);
-    m = LoadModel(filename, *sim);
-    if (m)
-      d = mj_makeData(m);
-    if (d)
+  try {
+    // request loadmodel if file given (otherwise drag-and-drop)
+    if (filename != nullptr)
     {
-      sim->Load(m, d, filename);
-      mj_forward(m, d);
+      sim->LoadMessage(filename);
+      m = LoadModel(filename, *sim);
+      if (m)
+        d = mj_makeData(m);
+      if (d)
+      {
+        sim->Load(m, d, filename);
+        const std::unique_lock<std::recursive_mutex> model_lock(sim->mtx);
+        mj_forward(m, d);
+        PrepareBridge();
 
-      // allocate ctrlnoise
-      free(ctrlnoise);
-      ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
-      mju_zero(ctrlnoise, m->nu);
+        // allocate ctrlnoise
+        free(ctrlnoise);
+        ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
+        mju_zero(ctrlnoise, m->nu);
+      }
+      else
+      {
+        sim->LoadMessageClear();
+      }
     }
-    else
-    {
-      sim->LoadMessageClear();
-    }
+
+    PhysicsLoop(*sim);
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << std::endl;
+    physics_result = 1;
+    sim->exitrequest.store(1);
   }
-
-  PhysicsLoop(*sim);
+  sdk_bridge.reset();
 
   // delete everything we allocated
   free(ctrlnoise);
   mj_deleteData(d);
   mj_deleteModel(m);
-
-  exit(0);
 }
 
-void *UnitreeSdk2BridgeThread(void *arg)
+// Headless execution uses the same bridge and mj_step model as the GUI.
+int RunHeadless()
 {
-  // Wait for mujoco data
-  while (true)
-  {
-    if (d)
-    {
-      std::cout << "Mujoco data is prepared" << std::endl;
-      break;
-    }
-    usleep(500000);
+  using namespace go2_sim;
+  char error[1024] = {};
+  std::unique_ptr<mjModel, decltype(&mj_deleteModel)> model(
+      mj_loadXML(param::config.robot_scene.c_str(), nullptr, error, sizeof(error)), mj_deleteModel);
+  if (!model) throw std::runtime_error(error);
+  std::unique_ptr<mjData, decltype(&mj_deleteData)> data(mj_makeData(model.get()), mj_deleteData);
+  if (!data) throw std::runtime_error("Could not allocate MuJoCo data");
+  mj_forward(model.get(), data.get());
+  auto bridge = CreateUnitreeBridge(model.get(), data.get());
+  InstallSignals();
+  std::cout << "Headless bridge ready: control=" << param::config.control << std::endl;
+  const double start = SteadySeconds();
+  auto deadline = std::chrono::steady_clock::now();
+  while (!stop_requested && (!param::config.duration || SteadySeconds() - start < param::config.duration)) {
+    bridge->run();
+    mj_step(model.get(), data.get());
+    deadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(model->opt.timestep));
+    std::this_thread::sleep_until(deadline);
   }
-
-  unitree::robot::ChannelFactory::Instance()->Init(param::config.domain_id, param::config.interface);
-
-
-  int body_id = mj_name2id(m, mjOBJ_BODY, "torso_link");
-  if (body_id < 0) {
-    body_id = mj_name2id(m, mjOBJ_BODY, "base_link");
-  }
-  param::config.band_attached_link = 6 * body_id;
-
-  std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  int idl_type = param::IDL_AUTO;
-  try {
-    idl_type = param::ResolveIdlType(param::config.robot, m->nu, param::config.idl_type);
-  } catch (const std::invalid_argument& error) {
-    std::cerr << error.what() << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-
-  if (idl_type == param::IDL_HG) {
-    std::cout << "Using unitree_hg DDS IDL for robot " << param::config.robot << std::endl;
-    interface = std::make_unique<G1Bridge>(m, d);
-  } else {
-    std::cout << "Using unitree_go DDS IDL for robot " << param::config.robot << std::endl;
-    interface = std::make_unique<Go2Bridge>(m, d);
-  }
-  interface->start();
-  
-  while (true)
-  {
-    sleep(1);
-  }
+  bridge.reset();
+  std::cout << "Headless simulator stopped" << std::endl;
+  return 0;
 }
 //------------------------------------------ main --------------------------------------------------
 
@@ -682,17 +692,28 @@ int main(int argc, char **argv)
   // Load simulation configuration
   std::filesystem::path proj_dir = std::filesystem::path(getExecutableDir()).parent_path();
   param::config.load_from_yaml(proj_dir / "config.yaml");
-  param::helper(argc, argv);
+  try {
+    param::helper(argc, argv);
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << std::endl;
+    return 2;
+  }
   if(param::config.robot_scene.is_relative()) {
     param::config.robot_scene = proj_dir.parent_path() / "unitree_robots" / param::config.robot / param::config.robot_scene;
+  }
+
+  try {
+    unitree::robot::ChannelFactory::Instance()->Init(param::config.domain_id, param::config.interface);
+    if (param::config.headless) return RunHeadless();
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << std::endl;
+    return 2;
   }
 
   // simulate object encapsulates the UI
   auto sim = std::make_unique<mj::Simulate>(
     std::make_unique<mj::GlfwAdapter>(),
     &cam, &opt, &pert, /* is_passive = */ false);
-
-  std::thread unitree_thread(UnitreeSdk2BridgeThread, nullptr);
 
   // start physics thread
   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());
@@ -701,6 +722,5 @@ int main(int argc, char **argv)
   sim->RenderLoop();
   physicsthreadhandle.join();
 
-  pthread_exit(NULL);
-  return 0;
+  return physics_result.load();
 }
